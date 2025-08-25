@@ -53,6 +53,27 @@ namespace bytedance {
 namespace flux {
 namespace ths_op {
 
+/**
+ *
+ * 总览：三条流 + 三个事件 + 两类屏障
+
+  流：
+  main_stream：当前 PyTorch 的 compute stream（getCurrentCUDAStream()）
+  cp_stream_intra_node：节点内 NVSHMEM/拷贝流
+  cp_stream_inter_node：跨节点 NVSHMEM/拷贝流
+
+  事件
+  ready_event：本地 shard 写入“就绪”
+  fetch_remote_event：远端 shard 拉取完成（跨/同节点）
+  all_gather_event：整个 all-gather/all-to-all 阶段完成
+
+  屏障/同步
+  nvshmemx_barrier_all_on_stream(main_stream)：全局队列式 barrier（含 quiet 语义）
+  nvshmemx_barrier_on_stream(NVSHMEMX_TEAM_NODE, cp_stream_inter_node)：节点内 barrier（含 quiet）
+  barrier_block（device 内存 + CUStreamWriteValue）：给 CUTLASS/GEMM 作为就绪标志数组
+ *
+ */
+
 /// This class only runs the basic grouped_gemm, it is mainly used for testing
 class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
  private:
@@ -154,11 +175,25 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
         moe_args.max_ntokens * moe_args.topk / moe_args.nexperts, ffn_size_shard, moe_args.hidden);
   }
 
+  /**
+   * 执行分布式 all-gather 和 all-to-all 通信操作
+   *
+   * 该函数实现了跨节点的数据收集和分发，主要功能包括：
+   * 1. 从所有节点收集输入数据分片到本地缓冲区
+   * 2. 使用 NVSHMEM 进行高效的跨节点通信
+   * 3. 通过 CUDA 事件和流实现异步通信同步
+   *
+   * @param inputs_shard 当前节点的输入数据分片 [ntokens_shard, hidden]
+   */
   void
   all_gather_all2all(torch::Tensor const &inputs_shard) {
     using namespace cute;
 
+    // 获取当前节点的 token 数量
     int ntokens_shard = inputs_shard.size(0);
+
+    // 创建完整的输入张量视图，用于存储所有节点的数据
+    // 形状: [element_size, hidden, ntokens_shard, world_size]
     Tensor full_input = make_tensor(
         static_cast<uint8_t *>(input_buffer.data_ptr()),
         make_shape(
@@ -166,46 +201,68 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
             ntokens_shard,
             tp_env.world_size));
 
-    // fetch data from other ranks and write the flag to mark the data ready
-    // outer loop iterating the node_idx, processing the current node first then others
-    // inner loop iterating the local_rank, use all2all for communication
+    // 外层循环：按节点索引遍历，优先处理当前节点，然后处理其他节点
+    // 内层循环：按本地 rank 遍历，使用 all2all 进行通信
     for (int node_idx = tp_env.node_idx, i = 0; i < tp_env.nnodes;
          ++i, node_idx = (node_idx + 1) % tp_env.nnodes) {
       if (node_idx == tp_env.node_idx) {
+        // 处理当前节点：将本地数据复制到共享缓冲区
         auto main_stream = c10::cuda::getCurrentCUDAStream();
         auto shard_input = full_input(_, _, tp_env.rank);
+
+        // 异步复制本地数据到共享缓冲区
         CUDA_CHECK(cudaMemcpyAsync(
             shard_input.data(),
             inputs_shard.data_ptr(),
             shard_input.size(),
             cudaMemcpyDeviceToDevice,
             main_stream));
+
+        // 同步所有节点，确保数据复制完成
         nvshmemx_barrier_all_on_stream(main_stream);
+
+        // 记录数据就绪事件，供其他节点等待
         CUDA_CHECK(cudaEventRecord(this->ready_event, main_stream));
         CUDA_CHECK(cudaStreamWaitEvent(this->cp_stream_intra_node, this->ready_event));
+
       } else {
+        // 处理远程节点：从其他节点获取数据
         FLUX_CHECK(nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE) == tp_env.local_rank);
+
         if (i == 1) {
-          // the first remote fetch wait for data ready
+          // 第一次远程获取时，等待数据就绪事件
           CUDA_CHECK(cudaStreamWaitEvent(this->cp_stream_inter_node, this->ready_event));
         }
+
+        // 计算源节点的全局 rank
         int src_rank = tp_env.local_rank_to_global_rank(tp_env.local_rank, node_idx);
         auto shard_input = full_input(_, _, src_rank);
+
+        // 使用 NVSHMEM 从远程节点获取数据
         nvshmemx_getmem_on_stream(
             shard_input.data(),
             shard_input.data(),
             shard_input.size(),
             src_rank,
             this->cp_stream_inter_node);
+
+        // 在节点内同步，确保数据获取完成
         nvshmemx_barrier_on_stream(NVSHMEMX_TEAM_NODE, this->cp_stream_inter_node);
+
+        // 记录远程获取完成事件
         CUDA_CHECK(cudaEventRecord(this->fetch_remote_event, this->cp_stream_inter_node));
         CUDA_CHECK(cudaStreamWaitEvent(this->cp_stream_intra_node, this->fetch_remote_event));
       }
+
+      // 内层循环：在节点内进行 all2all 通信
       for (int local_rank = tp_env.local_rank, j = 0; j < tp_env.local_world_size;
            ++j, local_rank = (local_rank + 1) % tp_env.local_world_size) {
+        // 计算源节点和目标节点的全局 rank
         int src_rank = tp_env.local_rank_to_global_rank(local_rank, node_idx);
         int local_rank_global = tp_env.local_rank_to_global_rank(local_rank);
+
         if (local_rank != tp_env.local_rank) {
+          // 从其他本地 rank 获取数据（排除自己）
           auto shard_input = full_input(_, _, src_rank);
           nvshmemx_getmem_on_stream(
               shard_input.data(),
@@ -214,6 +271,8 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
               local_rank_global,
               this->cp_stream_intra_node);
         }
+
+        // 写入屏障标志，表示该 rank 的数据已就绪
         CU_CHECK(CUStreamWriteValue(
             this->cp_stream_intra_node,
             (CUdeviceptr)(ptr_offset(barrier_block.get(), src_rank * sizeof(int))),
@@ -221,9 +280,27 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
             CU_STREAM_WRITE_VALUE_DEFAULT));
       }
     }
+
+    // 记录 all-gather 完成事件
     CUDA_CHECK(cudaEventRecord(this->all_gather_event, this->cp_stream_intra_node));
   }
 
+  /**
+   * 前向传播的核心实现函数
+   *
+   * NVSHMEM 与 Kernel 交互机制：
+   * 1. 共享内存分配：NVSHMEM 为所有节点分配共享内存空间 (input_buffer)
+   * 2. 数据收集：all_gather_all2all() 将所有节点的输入数据收集到共享缓冲区
+   * 3. Kernel 访问：GEMM kernel 通过指针直接访问共享缓冲区中的数据
+   * 4. 同步机制：使用 CUDA 事件和 NVSHMEM barrier 确保数据一致性
+   * 5. 内存管理：共享内存由 NVSHMEM 管理，避免传统 MPI 的通信开销
+   *
+   * 关键交互点：
+   * - ptr_A 指向 input_buffer.data_ptr() (NVSHMEM 共享内存)
+   * - Kernel 通过 gather 索引从共享内存读取数据
+   * - 通过 barrier_ptr 实现节点间同步
+   * - 使用 CUDA 流和事件实现异步通信与计算
+   */
   std::vector<torch::Tensor>
   forward_impl(
       torch::Tensor inputs_shard,
@@ -236,26 +313,32 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
       bool fast_accum,
       int sm_margin,
       c10::optional<UnifiedGemmHParams> const &hparams) {
+    // 输入验证：检查输入张量的数据类型、维度和形状
     CHECK_INPUT(inputs_shard, moe_args.input_dtype);
     CHECK_NDIM(inputs_shard, 2);
     int ntokens_shard = inputs_shard.size(0);
     CHECK_2D(inputs_shard, ntokens_shard, moe_args.hidden);
 
+    // 计算全局 token 数量（所有节点的 token 总数）
     int ntokens = ntokens_shard * tp_env.world_size;
 
+    // 验证权重张量
     std::size_t num_weights_group = weights.size();
     for (std::size_t i = 0; i < num_weights_group; ++i) {
       CHECK_INPUT(weights[i], moe_args.input_dtype);
       CHECK_3D(weights[i], nexperts_ep, ffn_size_shard, moe_args.hidden);
     }
 
+    // 验证专家分配信息
     CHECK_INPUT(splits_gpu, torch::kInt32);
     CHECK_NDIM(splits_gpu, 1);
     FLUX_CHECK_GE(splits_gpu.size(0), moe_args.nexperts);
 
+    // 验证散射索引
     CHECK_INPUT(scatter_index, torch::kInt32);
     CHECK_2D(scatter_index, ntokens, moe_args.topk);
 
+    // 验证输出缩放因子（如果提供）
     if (output_scale.has_value()) {
       TORCH_CHECK_EQ(output_scale->size(), num_weights_group);
       for (std::size_t i = 0; i < num_weights_group; ++i) {
@@ -265,7 +348,7 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
     }
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-    // Step 1: get op. and prepare op buffers
+    // 步骤 1: 获取 GEMM 操作符并准备操作缓冲区
     auto meta = this->get_gemm_meta(fast_accum);
     auto rt_conf = this->get_rt_conf();
     OpRegistry::OpPtr op;
@@ -276,7 +359,7 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
     }
 
     {
-      // initialize barrier_buffer
+      // 初始化屏障缓冲区 - 用于节点间同步
       auto tmp_args = GemmGroupedAgScatterArguments{};
       tmp_args.dist_env = tp_env;
       int64_t barrier_size = op->get_barrier_workspace_size(tmp_args);
@@ -287,15 +370,16 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
       CUDA_CHECK(cudaMemsetAsync(barrier_block.get(), 0, barrier_block.bytes()));
     }
 
-    // Step 2: Launch Allgather copies
+    // 步骤 2: 启动 All-gather 通信 - 通过 NVSHMEM 收集所有节点的输入数据
     this->all_gather_all2all(inputs_shard);
 
-    // Step 3: helper kernels. for preparing gather_index & sort tokens & outputs
+    // 步骤 3: 运行辅助 kernel 进行数据预处理
     std::vector<torch::Tensor> outputs;
     {
-      int32_t total_nrows_ep;  // to be initialized by cuda kernel later
+      int32_t total_nrows_ep;  // 将由 CUDA kernel 初始化
       int32_t *total_nrows_ep_gpu = static_cast<int32_t *>(this->total_nrows_ep_buffer.data_ptr());
 
+      // 计算 gather 索引：确定每个 token 应该从哪个位置读取数据
       calc_gather_index_impl(
           moe_args.nexperts,
           ntokens,
@@ -307,6 +391,8 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
           static_cast<int32_t *>(gather_index.data_ptr()),
           total_nrows_ep_gpu,
           stream);
+
+      // AG-Scatter 排序：对 token 进行排序以优化内存访问模式
       ag_scatter_sort_impl(
           AGScatterSortOpArguments{
               static_cast<DistEnv>(tp_env),
@@ -346,7 +432,7 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
       }
     }
 
-    // Step 4: prepare GEMM args
+    // 步骤 4: 准备 GEMM 参数
     using UnderlyingProblemShape = cute::Shape<int, int, int>;
     std::vector<UnderlyingProblemShape> problem_sizes;
     std::vector<void const *> ptr_A;
@@ -374,7 +460,7 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
         }
         for (std::size_t i = 0; i < num_weights_group; ++i) {
           problem_sizes.emplace_back(Mi, N, K);
-          ptr_A.emplace_back(input_buffer.data_ptr());
+          ptr_A.emplace_back(input_buffer.data_ptr());  // 指向 NVSHMEM 共享缓冲区
           ptr_B.emplace_back(
               ptr_offset(weights[i].data_ptr(), problem_param.expert_id * weight_bytes));
           ptr_C.emplace_back(nullptr);
@@ -410,7 +496,7 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
         static_cast<DistEnv>(tp_env),
         ntokens,
         moe_args.hidden,
-        input_buffer.data_ptr(),
+        input_buffer.data_ptr(),  // NVSHMEM 共享缓冲区指针
         ptr_gather_A.data(),
         ptr_scatter_D.data(),
         problem_schedules_arg.data(),
@@ -418,20 +504,18 @@ class GemmGroupedV3AGScatterOp::GemmGroupedV3AGScatterOpImpl {
 
     int64_t workspace_size = op->get_workspace_size(args);
     lazy_init_buffer_tensor(&this->workspace_buffer, workspace_size);
-    args.barrier_ptr = barrier_block.get();
+    args.barrier_ptr = barrier_block.get();  // 设置屏障指针
     args.sm_margin = sm_margin;
 
     if (tp_env.nnodes > 1) {
       CUDA_CHECK(cudaStreamWaitEvent(stream, this->fetch_remote_event));
     }
-    // Step 5: launch GEMM
+    // 步骤 5: 启动 GEMM kernel - Kernel 直接访问 NVSHMEM 共享缓冲区
     if (args.problem_count > 0) {
       op->run(args, workspace_buffer.data_ptr(), stream);
     }
     CUDA_CHECK(cudaStreamWaitEvent(stream, this->all_gather_event));
-    // ensure that when the next time each rank copy data to itself's shard in the
-    // input_buffer, all ranks have already finished allgather so that we can
-    // safely modify input_buffer
+    // 确保所有节点都完成了 all-gather 操作，避免数据竞争
     nvshmemx_barrier_all_on_stream(stream);
     if (allgather_output.has_value()) {
       CHECK_INPUT(allgather_output.value(), moe_args.input_dtype);
