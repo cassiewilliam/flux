@@ -48,20 +48,19 @@ execute_process(
 )
 
 add_subdirectory(ag_gemm)
-add_subdirectory(gemm_rs)
 
+# add_subdirectory(gemm_rs)
 find_package(CUDAToolkit REQUIRED)
 
 if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.3")
   add_subdirectory(quantization)
 endif()
 
-if(ENABLE_NVSHMEM)
-  # MoE OPs will not be open-sourced, so remain MoE OPs to be dependent on NVSHMEM
-  add_subdirectory(moe_ag_scatter)
-  add_subdirectory(moe_gather_rs)
-endif()
-
+# if(ENABLE_NVSHMEM)
+# # MoE OPs will not be open-sourced, so remain MoE OPs to be dependent on NVSHMEM
+# add_subdirectory(moe_ag_scatter)
+# add_subdirectory(moe_gather_rs)
+# endif()
 message(STATUS "op_targets: ${FLUX_CUDA_OP_TARGETS}")
 
 # this must be after all op subdirectory added
