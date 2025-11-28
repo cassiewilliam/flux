@@ -32,6 +32,7 @@ struct GemmV3BaseKernel {
   static constexpr auto meta = to_gemm_meta(GemmMetaT{});
   static constexpr auto hparams = to_gemm_hparams(GemmHParamsT{});
   static constexpr auto dt_conf = to_gemm_dtype_config(make_gemm_dtype_config(meta.dtype()));
+  static constexpr bool is_fp8_gemm = is_fp8_dtype(dt_conf.a()) && is_fp8_dtype(dt_conf.b());
   static constexpr bool is_s8_gemm = is_s8_dtype(dt_conf.a()) && is_s8_dtype(dt_conf.b());
 
   template <int EpiSmemSize = 0>
@@ -155,6 +156,7 @@ class GemmV3BaseDevice : public GemmOperatorBaseDefaultImplMixin<
   static constexpr auto hparams = to_gemm_hparams(GemmHParamsT{});
   using KernelBuilder = GemmV3BaseKernel<GemmMetaT, GemmHParamsT>;
   static constexpr bool is_s8_gemm = KernelBuilder::is_s8_gemm;
+  static constexpr bool is_fp8_gemm = KernelBuilder::is_fp8_gemm;
 
   //////////////////////////
   // CRTP functions

@@ -220,10 +220,6 @@ main(int argc, char const **args) {
       options,
       {
           cute::make_tuple(
-              GemmV2ReduceScatter_Space::get_space(),
-              std::string("gemm_rs/gemm_v2_reduce_scatter.hpp"),
-              std::string("GemmV2ReduceScatter")),
-          cute::make_tuple(
               GemmV3ReduceScatter_Space::get_space(),
               std::string("gemm_rs/gemm_v3_reduce_scatter.hpp"),
               std::string("GemmV3ReduceScatter")),

@@ -6,25 +6,17 @@ set -e
 export PATH=/usr/local/cuda/bin:$PATH
 CMAKE=${CMAKE:-cmake}
 
-ARCH=""
-SM_CORES=""
+ARCH="90"
+SM_CORES="132"
 BUILD_TEST="ON"
 BDIST_WHEEL="OFF"
 WITH_PROTOBUF="OFF"
 FLUX_DEBUG="OFF"
-ENABLE_NVSHMEM="OFF"
+ENABLE_NVSHMEM="ON"
 WITH_TRITON_AOT="OFF"
 
-function clean_py() {
-    rm -rf build/lib.*
-    rm -rf python/lib
-    rm -rf .egg/
-    rm -rf python/flux.egg-info
-    rm -rf python/flux_ths_pybind.*
-}
 
 function clean_all() {
-    clean_py
     rm -rf build/
     rm -rf 3rdparty/nccl/build
     rm -rf 3rdparty/protobuf/build
@@ -56,10 +48,6 @@ while [[ $# -gt 0 ]]; do
         JOBS="$2"
         shift # Skip the argument value
         shift # Skip the argument key
-        ;;
-    --clean-py)
-        clean_py
-        exit 0
         ;;
     --clean-all)
         clean_all
@@ -214,22 +202,6 @@ EOF
     fi
 }
 
-function build_flux_py {
-    LIBDIR=${PROJECT_ROOT}/python/flux/lib
-    mkdir -p ${LIBDIR}
-
-    pushd ${LIBDIR}
-    if [ $ENABLE_NVSHMEM == "ON" ]; then
-        export FLUX_SHM_USE_NVSHMEM=1
-    fi
-    popd
-    ##### build flux torch bindings #####
-    MAX_JOBS=${JOBS} python3 setup.py develop --user
-    if [ $BDIST_WHEEL == "ON" ]; then
-        MAX_JOBS=${JOBS} python3 setup.py bdist_wheel
-    fi
-}
-
 trap merge_compile_commands EXIT
 NCCL_ROOT=$PROJECT_ROOT/3rdparty/nccl
 build_nccl
@@ -254,4 +226,3 @@ fi
 
 build_protobuf
 build_flux_cuda
-build_flux_py
