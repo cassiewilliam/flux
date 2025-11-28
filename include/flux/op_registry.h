@@ -26,6 +26,7 @@
 #include <mutex>
 #include "cute/numeric/integral_constant.hpp"
 #include "flux/flux.h"
+#include "flux/utils.h"
 #include "flux/gemm_meta.h"
 #include "flux/gemm_hparams.h"
 #include "flux/gemm_operator_base.h"

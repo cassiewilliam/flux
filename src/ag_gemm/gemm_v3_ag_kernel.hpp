@@ -219,10 +219,7 @@ class GemmV3AGKernel_Device : public GemmV3BaseDevice<
     auto ptr_A = static_cast<ElementA const *>(args.A);
     auto ptr_B = static_cast<ElementB const *>(args.B);
     auto ptr_C = static_cast<ElementC const *>(args.Vector);
-    auto ptr_D = static_cast<ElementD *>(args.D);
-    [[maybe_unused]] auto ptr_scale_A = static_cast<ElementScale const *>(args.scaleA);
-    [[maybe_unused]] auto ptr_scale_B = static_cast<ElementScale const *>(args.scaleB);
-    auto beta = static_cast<ElementCNonVoid>(args.beta);
+    auto ptr_D = static_cast<ElementD*>(args.D);
 
     auto stride_A = cutlass::make_cute_packed_stride(
         typename GemmKernel::StrideA{}, cute::make_shape(args.m, args.k, 1));
@@ -237,36 +234,9 @@ class GemmV3AGKernel_Device : public GemmV3BaseDevice<
     typename GemmKernel::EpilogueArguments epilogue{
         {}, has_bias ? ptr_C : nullptr, stride_C, ptr_D, stride_D};
 
-    if constexpr (has_bias) {
-      epilogue.thread = {
-          // ternary op : beta * C + (scale_a * scale_b * Acc)
-          {beta},   // beta
-          {ptr_C},  // bias
-          {
-              // binary op : (scale_a * scale_b) * Acc
-              {
-                  // scale_a * scale_b
-                  {ptr_scale_A},  // scale_a
-                  {ptr_scale_B},  // scale_b
-                  {}              // binary args : multiplies
-              },                  // end binary op
-              {},                 // Acc
-              {}                  // binary args : multiplies
-          },                      // end binary op
-          {}                      // ternary args : multiply_add
-      };  // end ternary op
-    } else {
-      epilogue.thread = {
-          // (scale_a * scale_b) * Acc
-          {
-              {ptr_scale_A},  // scale_a
-              {ptr_scale_B},  // scale_b
-              {}              // binary args : multiplies
-          },                  // end binary op
-          {},                 // Acc
-          {}                  // binary args : multiplies
-      };  // end binary op
-    }
+    // For FP8 GEMM v3, use designated initializer similar to regular GEMM
+    epilogue.thread.alpha = args.alpha;
+    epilogue.thread.beta  = args.beta;
 
     using TileScheduler = typename GemmKernel::TileScheduler;
     using TileSchedulerTag = decltype(KernelBuilder().tile_scheduler());

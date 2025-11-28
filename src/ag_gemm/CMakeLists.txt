@@ -23,3 +23,7 @@ target_compile_options(${LIB_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-rdc=true>
 set(FLUX_CUDA_OP_TARGETS ${FLUX_CUDA_OP_TARGETS})
 list(APPEND FLUX_CUDA_OP_TARGETS ${LIB_NAME})
 set(FLUX_CUDA_OP_TARGETS ${FLUX_CUDA_OP_TARGETS} PARENT_SCOPE)
+
+if(BUILD_TEST)
+  add_subdirectory(test)
+endif()

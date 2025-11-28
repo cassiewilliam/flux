@@ -20,6 +20,7 @@
 namespace bytedance::flux {
 using namespace cute;
 
+/*
 static int config_gemm_rs_sm90_h800_tp8_nnodes1 = []() {
   auto &inst = TuningConfigRegistry::instance();
   inst.add(make_gemm_meta(make_gemm_dtype_config(_BF16{}(),_BF16{}(),_Void{}(),_BF16{}()),_Sm90{}(),_H800{}(),_ReduceScatter{}(),_RCR{}(),_GemmV3{}(),None{},make_reduce_scatter_meta(false,_IntraNode{}())),make_runtime_config(1024,12288,768,make_reduce_scatter_runtime_config(8,1)),make_gemm_hparams(make_gemm_v3_hparams(cute::make_tuple(1l,2l,1l)),None{},cute::make_tuple(128l,256l,64l),_GemmDefault{}(),0,_RasterHeuristic{}()));
@@ -138,5 +139,6 @@ static int config_gemm_rs_sm90_h800_tp8_nnodes1 = []() {
   inst.add(make_gemm_meta(make_gemm_dtype_config(_S8{}(),_S8{}(),_Void{}(),_BF16{}(),_S32{}()),_Sm90{}(),_H800{}(),_ReduceScatter{}(),_RCR{}(),_GemmV3{}(),make_gemm_v3_meta(false),make_reduce_scatter_meta(false,_IntraNode{}())),make_runtime_config(4096,4096,1024,make_reduce_scatter_runtime_config(8,1)),make_gemm_hparams(make_gemm_v3_hparams(cute::make_tuple(1l,2l,1l),_PingPong{}()),None{},cute::make_tuple(64l,128l,128l),_GemmDefault{}(),4,_RasterAlongM{}()));
   return 0;
 }();
+//*/
 }
 // clang-format on
