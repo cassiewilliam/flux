@@ -1,31 +1,38 @@
 #!/bin/bash
-# libflux_cuda.so maybe installed under /usr/local/lib or ~/.local/lib/ by pip3
+
+# 基础路径配置
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:~/.local/lib/
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 FLUX_SRC_DIR=${SCRIPT_DIR}
 
-# add flux python package to PYTHONPATH
+# 基础 CUDA/NVSHMEM 配置
 export NVSHMEM_BOOTSTRAP=UID
-export NVSHMEM_DISABLE_CUDA_VMM=1 # moving from cpp to shell
+export NVSHMEM_DISABLE_CUDA_VMM=1
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
-export CUDA_MODULE_LOADING=LAZY # EAGER if launch the consumer kernel before the producer kernel on host
+export CUDA_MODULE_LOADING=LAZY
 
-# set default communication env vars
-export BYTED_TORCH_BYTECCL=O0
-export NCCL_IB_TIMEOUT=${NCCL_IB_TIMEOUT:=23}
+# ---- 关键：彻底禁用所有 NCCL 插件 / IB / UCX ----
+export NCCL_NET_PLUGIN=none          # 禁用插件
+export NCCL_PLUGIN_DISABLE=1         # 禁用HPC-X插件加载
+export NCCL_UCX_DISABLE=1            # 禁用 UCX
+export NCCL_SHARP_DISABLE=1          # 禁用 SHARP
+export NCCL_IB_DISABLE=1             # 禁 IB（单机不需要）
+export NCCL_NET=Socket               # 强制走 socket
+export NCCL_SHM_DISABLE=0            # 启用共享内存
+export NCCL_P2P_DISABLE=0            # 启用PCIe/NVLink P2P
+export NCCL_DEBUG=WARN               # 输出最小信息
 
-nproc_per_node=$(nvidia-smi --list-gpus | wc -l)
+# UCX安全降级（如果容器内意外带了UCX）
+export UCX_TLS=sm,self,cuda_ipc
+export UCX_LOG_LEVEL=warn
+
+# Torchrun 设置
+nproc_per_node=2
 nnodes=1
 node_rank=0
 master_addr="127.0.0.1"
 master_port="23456"
 additional_args="--rdzv_endpoint=${master_addr}:${master_port}"
-IB_HCA=mlx5
-
-
-export NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:=3}
-export NVSHMEM_IB_GID_INDEX=3
-
 
 CMD="torchrun \
   --node_rank=${node_rank} \

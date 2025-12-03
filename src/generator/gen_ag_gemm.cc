@@ -128,6 +128,25 @@ struct GemmV3AGKernel_Space {
       cute::make_tuple(cute::_3{}, cute::_4{}),
       cute::make_tuple(_RasterAlongN{}, _RasterAlongM{}));
 
+  static constexpr auto AllGemmMeta_FP8 = make_space_gemm_meta(
+      cute::make_tuple(
+          make_gemm_dtype_config(_E4M3{}, _E4M3{}, _Void{}, _BF16{}),
+          make_gemm_dtype_config(_E4M3{}, _E4M3{}, _BF16{}, _BF16{})),
+      cute::make_tuple(_Sm90{}),
+      cute::make_tuple(_H800{}),
+      cute::make_tuple(_AGKernel{}),
+      cute::make_tuple(_RCR{}),
+      cute::make_tuple(_GemmV3{}),
+      cute::make_tuple(make_gemm_v3_meta(_True{}), make_gemm_v3_meta(_False{})));
+
+  static constexpr auto AllGemmHParams_FP8 = make_space_gemm_hparams(
+      cute::make_tuple(Auto{}),
+      cute::make_tuple(Auto{}),
+      cute::make_tuple(Auto{}),
+      cute::make_tuple(Auto{}),
+      cute::make_tuple(Auto{}),
+      cute::make_tuple(Auto{}));
+
   static constexpr auto AllGemmMeta_S8 = make_space_gemm_meta(
       cute::make_tuple(
           make_gemm_dtype_config(_S8{}, _S8{}, _BF16{}, _BF16{}, _S32{}),
@@ -168,6 +187,7 @@ struct GemmV3AGKernel_Space {
   get_space() {
     return merge_gen_space({
         build_gen_space(AllGemmMeta_FP16, AllGemmHParams_FP16),
+        build_gen_space(AllGemmMeta_FP8, AllGemmHParams_FP8),
         build_gen_space(AllGemmMeta_S8, AllGemmHParams_S8),
     });
   }

@@ -99,6 +99,102 @@ class GemmV3AGKernel_Device : public GemmV3BaseDevice<
   static constexpr auto meta = to_gemm_meta(GemmMetaT{});
   static constexpr auto hparams = to_gemm_hparams(GemmHParamsT{});
   static constexpr auto dt_conf = to_gemm_dtype_config(make_gemm_dtype_config(meta.dtype()));
+  static constexpr bool is_s8_gemm = is_s8_dtype(dt_conf.a()) && is_s8_dtype(dt_conf.b());
+  static constexpr bool is_fp8_gemm = is_fp8_dtype(dt_conf.a()) && is_fp8_dtype(dt_conf.b());
+
+  auto
+  to_fp8_gemm_args_impl(AGFP8KernelArguments const &args) const {
+    using Gemm = identity_t<decltype(this->gemm_device())>;
+    using GemmKernel = GemmKernelT;
+    using GemmArguments = typename Gemm::Arguments;
+
+    using ElementA = decltype(to_cutlass_element(dt_conf.a()));
+    using ElementB = decltype(to_cutlass_element(dt_conf.b()));
+    using ElementC = decltype(to_cutlass_element(dt_conf.c()));
+    using ElementD = decltype(to_cutlass_element(dt_conf.d()));
+    using ElementCNonVoid = cute::conditional_t<cute::is_void_v<ElementC>, ElementD, ElementC>;
+    using ElementScale = float;
+
+    auto ptr_A = static_cast<ElementA const *>(args.A);
+    auto ptr_B = static_cast<ElementB const *>(args.B);
+    auto ptr_C = static_cast<ElementC *>(const_cast<void *>(args.C));
+    auto ptr_D = static_cast<ElementD *>(args.D);
+    auto ptr_Aux = static_cast<ElementD *>(args.Aux);
+    auto ptr_Vector = static_cast<ElementCNonVoid *>(args.Vector);
+    auto ptr_scale_A = static_cast<ElementScale const *>(args.scaleA);
+    auto ptr_scale_B = static_cast<ElementScale const *>(args.scaleB);
+    auto ptr_scale_C = static_cast<ElementScale const *>(args.scaleC);
+    auto ptr_scale_D = static_cast<ElementScale const *>(args.scaleD);
+    auto ptr_scale_Aux = static_cast<ElementScale const *>(args.scaleAux);
+
+    auto stride_A = cutlass::make_cute_packed_stride(
+        typename GemmKernel::StrideA{}, cute::make_shape(args.m, args.k, 1));
+    auto stride_B = cutlass::make_cute_packed_stride(
+        typename GemmKernel::StrideB{}, cute::make_shape(args.n, args.k, 1));
+    auto stride_C = cutlass::make_cute_packed_stride(
+        typename GemmKernel::StrideC{}, cute::make_shape(args.m, args.n, 1));
+    auto stride_D = cutlass::make_cute_packed_stride(
+        typename GemmKernel::StrideD{}, cute::make_shape(args.m, args.n, 1));
+
+    using Epilogue = typename GemmKernel::CollectiveEpilogue;
+    // FP8 epilogue 需要先创建空的 epilogue，然后通过属性赋值
+    typename Epilogue::Arguments epilogue{{}, ptr_C, stride_C, ptr_D, stride_D};
+
+    using TileScheduler = typename GemmKernel::TileScheduler;
+    using TileSchedulerTag = decltype(KernelBuilder().tile_scheduler());
+    auto scheduler = typename TileScheduler::Arguments{};
+
+    if constexpr (cute::is_same_v<TileSchedulerTag, cutlass::gemm::AGKernelTileScheduler>) {
+      auto ptr_barrier = reinterpret_cast<typename SystemBarrier::T *>(args.barrier_buffer);
+      scheduler.ptr_barrier = ptr_barrier;
+    }
+
+    if constexpr (
+        cute::is_same_v<TileSchedulerTag, cutlass::gemm::AGKernelTileScheduler> ||
+        cute::is_same_v<TileSchedulerTag, cutlass::gemm::AGKernelStreamKScheduler>) {
+      if constexpr (hparams.raster_order() == _RasterAlongN{}) {
+        scheduler.raster_order = TileScheduler::RasterOrderOptions::AlongN;
+      } else {
+        scheduler.raster_order = TileScheduler::RasterOrderOptions::AlongM;
+      }
+      scheduler.nnodes = args.nnodes;
+      scheduler.rank = args.rank;
+      scheduler.world_size = args.world_size;
+      scheduler.local_world_size = args.world_size / args.nnodes;
+      scheduler.local_rank = args.rank % scheduler.local_world_size;
+    }
+
+    GemmArguments gemm_args{/*mode=*/cutlass::gemm::GemmUniversalMode::kGemm,
+                            /*problem_shape=*/{args.m, args.n, args.k},
+                            /*mainloop=*/
+                            {ptr_A, stride_A, ptr_B, stride_B},
+                            /*epilogue=*/epilogue,
+                            /*hw_info=*/{},
+                            /*scheduler=*/scheduler,
+                            args.barrier_buffer,
+                            args.rank,
+                            args.world_size};
+
+    // 配置 FP8 fusion args（通过属性赋值，参考 comm_none/gemm_v3_comm_none.hpp）
+    auto &fusion_args = gemm_args.epilogue.thread;
+    fusion_args.alpha = args.alpha;
+    fusion_args.beta = args.beta;
+    fusion_args.alpha_ptr = nullptr;
+    fusion_args.beta_ptr = nullptr;
+    fusion_args.scale_a = 1.0f;
+    fusion_args.scale_b = 1.0f;
+    fusion_args.scale_c = 0.0f;
+    fusion_args.scale_a_ptr = ptr_scale_A;
+    fusion_args.scale_b_ptr = ptr_scale_B;
+    fusion_args.scale_c_ptr = ptr_scale_C;
+    fusion_args.scale_d = 1.0f;
+    fusion_args.scale_aux = 1.0f;
+    fusion_args.scale_d_ptr = ptr_scale_D;
+    fusion_args.scale_aux_ptr = ptr_scale_Aux;
+    fusion_args.bias_ptr = nullptr;  // FP8 通常不使用 bias
+
+    return gemm_args;
+  }
 
   auto
   to_s8_gemm_args_impl(AGS8KernelArguments const &args) const {
@@ -268,7 +364,9 @@ class GemmV3AGKernel_Device : public GemmV3BaseDevice<
 
   auto
   to_gemm_args(std::any const &args) const {
-    if constexpr (this->is_s8_gemm) {
+    if constexpr (this->is_fp8_gemm) {
+      return to_fp8_gemm_args_impl(std::any_cast<AGFP8KernelArguments>(args));
+    } else if constexpr (this->is_s8_gemm) {
       return to_s8_gemm_args_impl(std::any_cast<AGS8KernelArguments>(args));
     } else {
       return to_gemm_args_impl(std::any_cast<AGKernelArguments>(args));
